@@ -1,0 +1,96 @@
+# Copies desktop releases from kubilayege/minnow-releases into this repo: same tag, same
+# installers, same notes.
+#
+# This is a stopgap. Builds still happen in kubilayege/minnow and land in that account's releases
+# repo; this pulls them across so the org has them, and so this repo can already serve app
+# updates. It goes away once JoygameMobileTechnology/minnow builds and publishes here directly,
+# which needs a credential that GITHUB_TOKEN cannot provide (an org-owned GitHub App, or a PAT).
+#
+# Nothing is pushed from the other side and there is no secret here: the source repo is public, so
+# reading it needs no credentials, and writes use the GITHUB_TOKEN Actions mints for the job,
+# which only works on this repo.
+#
+# The schedule picks up new releases on its own; "Run workflow" takes a tag, or blank for every
+# release this repo is missing.
+name: Mirror releases
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to mirror, e.g. v0.1.9 (blank: every release missing here)"
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-releases
+
+env:
+  SOURCE_REPO: kubilayege/minnow-releases
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Copy the releases this repo is missing
+        env:
+          # The repo's own token: write here, read-only on anything public.
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ONLY: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "$ONLY" ]; then
+            tags="$ONLY"
+          else
+            # Oldest first, so whichever release ends up marked "Latest" is the newest one.
+            tags=$(gh release list -R "$SOURCE_REPO" -L 200 --json tagName,isDraft,publishedAt \
+              -q 'sort_by(.publishedAt) | .[] | select(.isDraft | not) | .tagName')
+          fi
+          latest=$(gh release view -R "$SOURCE_REPO" --json tagName -q .tagName)
+          for tag in $tags; do
+            if [ -z "$ONLY" ] && gh release view "$tag" >/dev/null 2>&1; then continue; fi
+            echo "::group::$tag"
+            rm -rf mirror && mkdir mirror
+            gh release download "$tag" -R "$SOURCE_REPO" -D mirror --clobber
+            files=(mirror/*)
+            if [ ! -e "${files[0]}" ]; then
+              echo "::warning::$tag has no assets, skipped"
+              echo "::endgroup::"
+              continue
+            fi
+            gh release view "$tag" -R "$SOURCE_REPO" --json body -q .body > notes.md
+            title=$(gh release view "$tag" -R "$SOURCE_REPO" --json name -q .name)
+            pre=$(gh release view "$tag" -R "$SOURCE_REPO" --json isPrerelease -q .isPrerelease)
+            # Draft first, so nobody downloads a half-uploaded release.
+            if gh release view "$tag" >/dev/null 2>&1; then
+              gh release edit "$tag" --draft=true --notes-file notes.md
+            else
+              gh release create "$tag" --draft --title "${title:-Minnow ${tag#v}}" --notes-file notes.md
+            fi
+            gh release upload "$tag" --clobber "${files[@]}"
+            args=(--draft=false)
+            if [ "$tag" = "$latest" ]; then args+=(--latest); fi
+            if [ "$pre" = "true" ]; then args+=(--prerelease); fi
+            gh release edit "$tag" "${args[@]}"
+            printf '%s\t%s\n' "$(date -u +%FT%TZ)" "$tag" >> mirrored.tsv
+            rm -rf mirror
+            echo "::endgroup::"
+          done
+      # The commit is also what keeps the schedule alive: GitHub disables cron in a repo that sees
+      # no activity for 60 days.
+      - name: Record what was copied
+        run: |
+          set -eu
+          if [ -z "$(git status --porcelain mirrored.tsv)" ]; then exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add mirrored.tsv
+          git commit -m "Mirror $(tail -1 mirrored.tsv | cut -f2)"
+          git push
